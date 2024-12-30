@@ -102,8 +102,8 @@ def download_models():
             remote_path="/root/SAT/data"
         ),
         modal.Mount.from_local_dir(
-            "results",  # Local directory
-            remote_path="/root/SAT/results"  # Remote directory
+            "results",
+            remote_path="/root/SAT/results"
         )
     ],
     timeout=3600,
@@ -122,34 +122,40 @@ async def run_sat_inference(
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     
-    base_path = Path("/root/SAT")
-    checkpoint_path = Path("/root/checkpoints")
+    # Convert all paths to strings to avoid mixing Path and str objects
+    base_path = str(Path("/root/SAT"))
+    checkpoint_path = str(Path("/root/checkpoints"))
     
     # Update paths to match download location
-    vision_model_path = str(checkpoint_path / "nano.pth")
-    text_encoder_path = str(checkpoint_path / "nano_text_encoder.pth")
+    vision_model_path = str(Path(checkpoint_path) / "nano.pth")
+    text_encoder_path = str(Path(checkpoint_path) / "nano_text_encoder.pth")
+    output_path = str(Path("/root/SAT/results"))
+    
+    # Create output directory
+    os.makedirs(output_path, exist_ok=True)
     
     # Add debug prints
     print("Contents of checkpoints directory:")
-    for file in checkpoint_path.glob("**/*"):
+    for file in Path(checkpoint_path).glob("**/*"):
         print(f"  {file}")
-    print(f"Checking if vision model exists: {Path(vision_model_path).exists()}")
-    print(f"Checking if text encoder exists: {Path(text_encoder_path).exists()}")
-    print(f"Checking if input_jsonl exists: {Path(input_jsonl).exists()}")
+    print(f"Checking if vision model exists: {os.path.exists(vision_model_path)}")
+    print(f"Checking if text encoder exists: {os.path.exists(text_encoder_path)}")
+    print(f"Checking if input_jsonl exists: {os.path.exists(input_jsonl)}")
     
+    # Construct command with all string paths
     cmd = [
         "torchrun",
         "--nproc_per_node=1",
         "--master_port", "1234",
-        str(base_path / "inference.py"),
-        "--rcd_dir", output_dir,
+        str(Path(base_path) / "inference.py"),
+        "--rcd_dir", output_path,
         "--datasets_jsonl", input_jsonl,
         "--vision_backbone", "UNET",
         "--checkpoint", vision_model_path,
         "--text_encoder", "ours",
         "--text_encoder_checkpoint", text_encoder_path,
-        "--max_queries", "128",  # Reduced for memory
-        "--batchsize_3d", "1",   # Reduced for memory
+        "--max_queries", "128",
+        "--batchsize_3d", "1",
     ]
     
     print("Running command:", " ".join(cmd))
@@ -171,8 +177,14 @@ async def run_sat_inference(
                 stderr=process.stderr
             )
             
+        if process.returncode == 0:
+            # Debug: List contents of results directory
+            print("\nContents of results directory after inference:")
+            for file in Path(output_path).glob("**/*"):
+                print(f"  {file}")
+
         return {
-            "output_dir": output_dir,
+            "output_dir": output_path,
             "stdout": process.stdout,
             "stderr": process.stderr
         }
@@ -181,7 +193,7 @@ async def run_sat_inference(
         print("Error running inference:")
         print("STDOUT:", e.output)
         print("STDERR:", e.stderr)
-        raise 
+        raise
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         raise
