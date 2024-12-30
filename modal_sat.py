@@ -17,7 +17,7 @@ image = (
     .apt_install("git", "wget")
     .pip_install(
         "numpy>=1.24.0",
-        "monai>=1.1.0",
+        "monai==0.9.1",
         "transformers>=4.21.3",
         "nibabel>=4.0.2",
         "einops>=0.6.0",
@@ -94,60 +94,93 @@ def download_models():
 
 @app.function(
     image=image,
-    gpu="A100",
+    gpu="T4",
     volumes={"/root/checkpoints": volume},
     mounts=[
         modal.Mount.from_local_dir(
             "data",
-            remote_path="/root/data"
+            remote_path="/root/SAT/data"
         ),
     ],
     timeout=3600,
 )
 async def run_sat_inference(
-    input_jsonl: str = "data/inference_demo/demo.jsonl",
+    input_jsonl: str = "/root/SAT/data/inference_demo/demo.jsonl",
     output_dir: str = "results",
-    model_type: str = "nano",  # Changed default to nano
+    model_type: str = "nano",
 ):
     """GPU function that runs the actual inference."""
     import subprocess
+    import os
     from pathlib import Path
+    
+    # Set memory management environment variables
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     
     base_path = Path("/root/SAT")
     checkpoint_path = Path("/root/checkpoints")
     
-    # Updated configuration for Nano model
-    vision_backbone = "UNET"  # Nano uses UNET
-    batch_size = 2  # Default batch size for Nano
+    # Update paths to match download location
+    vision_model_path = str(checkpoint_path / "nano.pth")
+    text_encoder_path = str(checkpoint_path / "nano_text_encoder.pth")
+    
+    # Add debug prints
+    print("Contents of checkpoints directory:")
+    for file in checkpoint_path.glob("**/*"):
+        print(f"  {file}")
+    print(f"Checking if vision model exists: {Path(vision_model_path).exists()}")
+    print(f"Checking if text encoder exists: {Path(text_encoder_path).exists()}")
+    print(f"Checking if input_jsonl exists: {Path(input_jsonl).exists()}")
     
     cmd = [
         "torchrun",
         "--nproc_per_node=1",
         "--master_port", "1234",
-        "inference.py",
+        str(base_path / "inference.py"),
         "--rcd_dir", output_dir,
         "--datasets_jsonl", input_jsonl,
-        "--vision_backbone", vision_backbone,
-        "--checkpoint", str(checkpoint_path / "Nano/nano.pth"),
+        "--vision_backbone", "UNET",
+        "--checkpoint", vision_model_path,
         "--text_encoder", "ours",
-        "--text_encoder_checkpoint", str(checkpoint_path / "Nano/nano_text_encoder.pth"),
-        "--max_queries", "256",
-        "--batchsize_3d", str(batch_size)
+        "--text_encoder_checkpoint", text_encoder_path,
+        "--max_queries", "128",  # Reduced for memory
+        "--batchsize_3d", "1",   # Reduced for memory
     ]
     
-    process = subprocess.run(
-        cmd,
-        cwd=base_path,
-        check=True,
-        capture_output=True,
-        text=True
-    )
+    print("Running command:", " ".join(cmd))
     
-    return {
-        "output_dir": output_dir,
-        "stdout": process.stdout,
-        "stderr": process.stderr
-    }
+    try:
+        process = subprocess.run(
+            cmd,
+            cwd=base_path,
+            capture_output=True,
+            text=True
+        )
+        print("STDOUT:", process.stdout)
+        print("STDERR:", process.stderr)
+        
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(
+                process.returncode, cmd, 
+                output=process.stdout,
+                stderr=process.stderr
+            )
+            
+        return {
+            "output_dir": output_dir,
+            "stdout": process.stdout,
+            "stderr": process.stderr
+        }
+        
+    except subprocess.CalledProcessError as e:
+        print("Error running inference:")
+        print("STDOUT:", e.output)
+        print("STDERR:", e.stderr)
+        raise  # Re-raise the exception after logging
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        raise
 
 @app.local_entrypoint()
 def main():
