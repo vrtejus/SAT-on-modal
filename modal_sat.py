@@ -101,6 +101,10 @@ def download_models():
             "data",
             remote_path="/root/SAT/data"
         ),
+        modal.Mount.from_local_dir(
+            "results",  # Local directory
+            remote_path="/root/SAT/results"  # Remote directory
+        )
     ],
     timeout=3600,
 )
@@ -177,7 +181,7 @@ async def run_sat_inference(
         print("Error running inference:")
         print("STDOUT:", e.output)
         print("STDERR:", e.stderr)
-        raise  # Re-raise the exception after logging
+        raise 
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         raise
