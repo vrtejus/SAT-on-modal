@@ -1,12 +1,14 @@
-import modal
+import modal  # type: ignore
 import os
+import subprocess
 from pathlib import Path
 
 # Define the Modal app
 app = modal.App("sat-medical-segmentation-nano")
 
 # Create persistent volume for model weights
-volume = modal.Volume.from_name("sat-model-weights", create_if_missing=True)
+model_weights_volume = modal.Volume.from_name("sat-model-weights", create_if_missing=True)
+results_volume = modal.Volume.from_name("sat-results-volume", create_if_missing=True)
 
 # Create secret for HF token
 secret = modal.Secret.from_dict({"HF_TOKEN": "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"})
@@ -39,33 +41,25 @@ image = (
 
 @app.function(
     image=image,
-    volumes={"/root/checkpoints": volume},
+    volumes={"/root/checkpoints": model_weights_volume},
     secrets=[secret]
 )
 def download_models():
     """CPU-only function to download model weights."""
-    from huggingface_hub import hf_hub_download
-    import os
+    from huggingface_hub import hf_hub_download  # type: ignore
     
-    results = {
-        "success": True,
-        "messages": []
-    }
-    
-    # Create checkpoints directory if it doesn't exist
+    results = {"success": True, "messages": []}
     os.makedirs("/root/checkpoints", exist_ok=True)
-    
-    # Get token from environment
     hf_token = os.environ["HF_TOKEN"]
-    
-    # Download models from HuggingFace - Updated for Nano
+
     models = {
         "nano.pth": "Nano/nano.pth",
         "nano_text_encoder.pth": "Nano/nano_text_encoder.pth"
     }
     
     for local_name, hf_path in models.items():
-        if not os.path.exists(f"/root/checkpoints/{local_name}"):
+        full_ckpt_path = f"/root/checkpoints/{local_name}"
+        if not os.path.exists(full_ckpt_path):
             try:
                 results["messages"].append(f"Downloading {local_name}...")
                 file_path = hf_hub_download(
@@ -75,36 +69,28 @@ def download_models():
                     token=hf_token
                 )
                 results["messages"].append(f"Downloaded to: {file_path}")
-                
-                # Create target directory if needed
-                target_dir = os.path.dirname(f"/root/checkpoints/{local_name}")
-                os.makedirs(target_dir, exist_ok=True)
-                
-                # Move file to correct location
-                target_path = f"/root/checkpoints/{local_name}"
-                os.rename(file_path, target_path)
-                results["messages"].append(f"Moved to: {target_path}")
-                
+
+                os.makedirs(os.path.dirname(full_ckpt_path), exist_ok=True)
+                os.rename(file_path, full_ckpt_path)
+                results["messages"].append(f"Moved to: {full_ckpt_path}")
             except Exception as e:
                 results["success"] = False
                 results["messages"].append(f"Error downloading {local_name}: {str(e)}")
-    
+
     results["messages"].append("Model download complete!")
     return results
 
 @app.function(
     image=image,
     gpu="T4",
-    volumes={"/root/checkpoints": volume},
+    # Here we only mount model weights by default;
+    # We'll dynamically attach the results volume below.
+    volumes={
+        "/root/checkpoints": model_weights_volume,
+        "/root/SAT/results": results_volume,
+    },
     mounts=[
-        modal.Mount.from_local_dir(
-            "data",
-            remote_path="/root/SAT/data"
-        ),
-        modal.Mount.from_local_dir(
-            "results",
-            remote_path="/root/SAT/results"
-        )
+        modal.Mount.from_local_dir("data", remote_path="/root/SAT/data")
     ],
     timeout=3600,
 )
@@ -114,40 +100,31 @@ async def run_sat_inference(
     model_type: str = "nano",
 ):
     """GPU function that runs the actual inference."""
-    import subprocess
-    import os
-    from pathlib import Path
-    
-    # Set memory management environment variables
+    from modal import Volume  # type: ignore
+
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     
-    # Convert all paths to strings to avoid mixing Path and str objects
-    base_path = str(Path("/root/SAT"))
-    checkpoint_path = str(Path("/root/checkpoints"))
-    
-    # Update paths to match download location
-    vision_model_path = str(Path(checkpoint_path) / "nano.pth")
-    text_encoder_path = str(Path(checkpoint_path) / "nano_text_encoder.pth")
-    output_path = str(Path("/root/SAT/results"))
-    
-    # Create output directory
+    base_path = "/root/SAT"
+    checkpoint_path = "/root/checkpoints"
+    vision_model_path = f"{checkpoint_path}/nano.pth"
+    text_encoder_path = f"{checkpoint_path}/nano_text_encoder.pth"
+    output_path = "/root/SAT/results"
+
     os.makedirs(output_path, exist_ok=True)
-    
-    # Add debug prints
+
     print("Contents of checkpoints directory:")
-    for file in Path(checkpoint_path).glob("**/*"):
-        print(f"  {file}")
+    for file_path in Path(checkpoint_path).glob("**/*"):
+        print(f"  {file_path}")
     print(f"Checking if vision model exists: {os.path.exists(vision_model_path)}")
     print(f"Checking if text encoder exists: {os.path.exists(text_encoder_path)}")
     print(f"Checking if input_jsonl exists: {os.path.exists(input_jsonl)}")
-    
-    # Construct command with all string paths
+
     cmd = [
         "torchrun",
         "--nproc_per_node=1",
         "--master_port", "1234",
-        str(Path(base_path) / "inference.py"),
+        f"{base_path}/inference.py",
         "--rcd_dir", output_path,
         "--datasets_jsonl", input_jsonl,
         "--vision_backbone", "UNET",
@@ -157,69 +134,66 @@ async def run_sat_inference(
         "--max_queries", "128",
         "--batchsize_3d", "1",
     ]
-    
-    print("Running command:", " ".join(cmd))
-    
-    try:
-        process = subprocess.run(
-            cmd,
-            cwd=base_path,
-            capture_output=True,
-            text=True
-        )
-        print("STDOUT:", process.stdout)
-        print("STDERR:", process.stderr)
-        
-        if process.returncode != 0:
-            raise subprocess.CalledProcessError(
-                process.returncode, cmd, 
-                output=process.stdout,
-                stderr=process.stderr
-            )
-            
-        if process.returncode == 0:
-            # Debug: List contents of results directory
-            print("\nContents of results directory after inference:")
-            for file in Path(output_path).glob("**/*"):
-                print(f"  {file}")
 
-        return {
-            "output_dir": output_path,
-            "stdout": process.stdout,
-            "stderr": process.stderr
-        }
-        
-    except subprocess.CalledProcessError as e:
-        print("Error running inference:")
-        print("STDOUT:", e.output)
-        print("STDERR:", e.stderr)
-        raise
-    except Exception as e:
-        print(f"Unexpected error: {str(e)}")
-        raise
+    print("Running command:", " ".join(cmd))
+    process = subprocess.run(cmd, cwd=base_path, capture_output=True, text=True)
+    print("STDOUT:", process.stdout)
+    print("STDERR:", process.stderr)
+
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(
+            process.returncode, cmd, 
+            output=process.stdout,
+            stderr=process.stderr
+        )
+
+    # Debug: list what got written
+    print("\nContents of /root/SAT/results after inference:")
+    for file_path in Path(output_path).glob("**/*"):
+        print("  ", file_path)
+
+    return {
+        "output_dir": output_path,
+        "stdout": process.stdout,
+        "stderr": process.stderr
+    }
 
 @app.local_entrypoint()
 def main():
-    # First check if models are downloaded
+    # 1. Download Models
     print("Checking models...")
-    download_result = download_models.remote()
-    for message in download_result["messages"]:
-        print(message)
-    if not download_result["success"]:
+    dl_result = download_models.remote()
+    for msg in dl_result["messages"]:
+        print(msg)
+    if not dl_result["success"]:
         print("Failed to download models.")
         return
-    
-    # Run inference
+
+    # 2. Run Inference
     print("\nRunning inference with Nano model...")
     try:
         result = run_sat_inference.remote()
         print("\nInference completed successfully!")
-        print(f"Results saved to: {result['output_dir']}")
+        print(f"Results saved (remotely) to: {result['output_dir']}")
+
+        # 3. Download from the volume’s root "/" to local
+        # 'sat-results-volume' -> local 'results_downloaded/'
+        local_folder = "results_downloaded"
+        print(f"\nPulling results from volume '{RESULTS_VOLUME_NAME}' to ./{local_folder}/ ...")
+        subprocess.run(
+            ["modal", "volume", "get", RESULTS_VOLUME_NAME, "/", local_folder],
+            check=True
+        )
+        print(f"Results downloaded into: ./{local_folder}/")
+
+        # Print logs if needed
         if result["stdout"]:
-            print("\nOutput log:")
+            print("\n=== Inference STDOUT ===\n")
             print(result["stdout"])
+
     except Exception as e:
         print(f"\nError during inference: {str(e)}")
         if hasattr(e, 'stderr'):
             print("\nError details:")
             print(e.stderr)
+
